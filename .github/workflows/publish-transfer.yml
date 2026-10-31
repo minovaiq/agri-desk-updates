@@ -1,0 +1,26 @@
+name: Publish transferred Windows update
+on:
+  push:
+    branches: [main]
+    paths: [release-request.json]
+permissions:
+  contents: write
+concurrency:
+  group: public-windows-release
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Install pinned metadata parser
+        run: npm install --prefix "$RUNNER_TEMP/agri-release-tools" --no-save --package-lock=false --ignore-scripts js-yaml@4.3.2
+      - name: Verify and publish the compiled release bundle
+        env:
+          GH_TOKEN: ${{ github.token }}
+          NODE_PATH: ${{ runner.temp }}/agri-release-tools/node_modules
+        run: node scripts/publish-transfer.cjs
