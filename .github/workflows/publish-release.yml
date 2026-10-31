@@ -1,0 +1,62 @@
+name: Publish verified Windows update
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Draft release tag, for example v1.3.0
+        required: true
+        type: string
+permissions:
+  contents: write
+concurrency:
+  group: public-windows-release
+  cancel-in-progress: false
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RELEASE_TAG: ${{ inputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+      - name: Validate draft destination
+        shell: bash
+        run: |
+          set -euo pipefail
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo 'Invalid stable version tag'; exit 1; }
+          test "$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft)" = true
+          previous=$(gh release view --repo "$GITHUB_REPOSITORY" --json tagName --jq .tagName 2>/dev/null || true)
+          PREVIOUS_TAG="$previous" node -e 'const parse=x=>x.replace(/^v/, "").split(".").map(BigInt);const old=process.env.PREVIOUS_TAG;if(old){const a=parse(process.env.RELEASE_TAG),b=parse(old);let c=0;for(let i=0;i<3;i++){if(a[i]!==b[i]){c=a[i]>b[i]?1:-1;break;}}if(c<=0)throw Error("Increase the version; do not overwrite or downgrade a published release");}'
+      - name: Download compiled release bundle
+        run: gh release download "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --pattern "Agri-Desk-Release-$RELEASE_TAG.zip" --dir incoming
+      - name: Extract only the expected installer files
+        shell: python
+        run: |
+          import os, pathlib, zipfile
+          tag = os.environ['RELEASE_TAG']
+          version = tag[1:]
+          name = f'Agri-Desk-Setup-{version}-x64.exe'
+          expected = {name, name + '.blockmap', 'latest.yml'}
+          with zipfile.ZipFile(f'incoming/Agri-Desk-Release-{tag}.zip') as z:
+            if set(z.namelist()) != expected or len(z.namelist()) != 3:
+              raise ValueError('Bundle must contain exactly the matching EXE, blockmap and latest.yml')
+            if sum(i.file_size for i in z.infolist()) > 650 * 1024 * 1024:
+              raise ValueError('Release bundle is too large')
+            if z.testzip() is not None:
+              raise ValueError('Corrupt release bundle')
+            pathlib.Path('payload').mkdir()
+            z.extractall('payload')
+      - name: Install pinned metadata parser
+        run: npm install --prefix "$RUNNER_TEMP/agri-release-tools" --no-save --package-lock=false --ignore-scripts js-yaml@4.3.2
+      - name: Verify stable version, PE header, SHA-512, size and blockmap
+        env:
+          NODE_PATH: ${{ runner.temp }}/agri-release-tools/node_modules
+        run: node scripts/verify-payload.cjs payload "${RELEASE_TAG#v}"
+      - name: Attach complete update assets before making the release visible
+        run: gh release upload "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" "payload/Agri-Desk-Setup-${RELEASE_TAG#v}-x64.exe" "payload/Agri-Desk-Setup-${RELEASE_TAG#v}-x64.exe.blockmap" payload/latest.yml --clobber
+      - name: Publish stable release
+        run: gh release edit "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --draft=false --latest
